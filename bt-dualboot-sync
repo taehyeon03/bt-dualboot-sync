@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+bt-dualboot-sync - stop re-pairing Bluetooth devices on Windows/Linux dual-boot PCs.
+
+Why you have to re-pair: when a device pairs, the PC and the device agree on a
+secret "link key". Windows and Linux each store their own copy, so pairing in
+one OS replaces the key on the device and the other OS's copy becomes invalid.
+
+This tool makes both OSes use the SAME key:
+  * Windows -> Linux: reads the Windows SYSTEM registry hive directly from the
+    Windows partition (read-only, no extra packages) and writes the keys into
+    BlueZ (/var/lib/bluetooth).
+  * Linux -> Windows: exports BlueZ keys to the EFI partition, where the
+    companion Windows script (windows/bt-dualboot-sync.ps1) imports them.
+
+Zero dependencies: Python 3.7+ standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import configparser
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+VERSION = "0.1.0"
+PROG = "bt-dualboot-sync"
+
+DEFAULT_BLUEZ_DIR = "/var/lib/bluetooth"
+DEFAULT_STATE_FILE = "/var/lib/bt-dualboot-sync/state.json"
+DEFAULT_BACKUP_DIR = "/var/backups/bt-dualboot-sync"
+EXPORT_SUBDIR = "bt-dualboot-sync"
+EXPORT_FILENAME = "bluez-keys.json"
+ESP_CANDIDATES = ("/boot/efi", "/efi", "/boot")
+INSTALL_BIN = "/usr/local/bin/bt-dualboot-sync"
+UNIT_PATH = "/etc/systemd/system/bt-dualboot-sync.service"
+KEEP_BACKUPS = 10
+
+UNIT_TEMPLATE = """[Unit]
+Description=Sync Bluetooth pairing keys with Windows (dual boot)
+Documentation=https://github.com/taehyeon03/bt-dualboot-sync
+DefaultDependencies=no
+After=local-fs.target
+Before=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart={bin} auto --yes --no-restart
+TimeoutStartSec=90
+
+[Install]
+WantedBy=bluetooth.service multi-user.target
+"""
+
+
+class UserError(Exception):
+    """An error that should be shown to the user without a traceback."""
+
+
+# --------------------------------------------------------------------------
+# Minimal read-only parser for Windows registry hive files ("regf" format)
+# --------------------------------------------------------------------------
+
+REG_SZ = 1
+REG_EXPAND_SZ = 2
+REG_BINARY = 3
+REG_DWORD = 4
+REG_QWORD = 11
+NO_OFFSET = 0xFFFFFFFF
+
+
+class HiveError(Exception):
+    pass
+
+
+class Hive:
+    HBIN_START = 4096
+
+    def __init__(self, data: bytes):
+        if len(data) < self.HBIN_START or data[:4] != b"regf":
+            raise HiveError("not a Windows registry hive (missing 'regf' signature)")
+        self.data = data
+        seq1, seq2 = struct.unpack_from("<II", data, 4)
+        # Different sequence numbers mean Windows did not finish writing the
+        # hive; the newest changes may only exist in SYSTEM.LOG1/LOG2.
+        self.dirty = seq1 != seq2
+        root_offset = struct.unpack_from("<I", data, 0x24)[0]
+        self.root = Key(self, root_offset)
+
+    @classmethod
+    def open(cls, path: str) -> "Hive":
+        with open(path, "rb") as f:
+            return cls(f.read())
+
+    def cell(self, offset: int) -> bytes:
+        pos = self.HBIN_START + offset
+        if offset == NO_OFFSET or pos + 4 > len(self.data):
+            raise HiveError("cell offset out of range: %#x" % offset)
+        size = abs(struct.unpack_from("<i", self.data, pos)[0])
+        if size < 4 or pos + size > len(self.data):
+            raise HiveError("corrupt cell at %#x" % offset)
+        return self.data[pos + 4:pos + size]
+
+    def read_data(self, offset: int, size: int) -> bytes:
+        cell = self.cell(offset)
+        if size > 16344 and cell[:2] == b"db":  # "big data" split into segments
+            count, list_offset = struct.unpack_from("<HI", cell, 2)
+            seg_list = self.cell(list_offset)
+            buf = bytearray()
+            for i in range(count):
+                seg = self.cell(struct.unpack_from("<I", seg_list, 4 * i)[0])
+                buf += seg[:min(16344, size - len(buf))]
+            return bytes(buf)
+        return cell[:size]
+
+
+class Key:
+    def __init__(self, hive: Hive, offset: int):
+        c = hive.cell(offset)
+        if c[:2] != b"nk":
+            raise HiveError("expected key record at %#x" % offset)
+        self.hive = hive
+        flags = struct.unpack_from("<H", c, 2)[0]
+        self._n_subkeys = struct.unpack_from("<I", c, 20)[0]
+        self._subkeys_offset = struct.unpack_from("<I", c, 28)[0]
+        self._n_values = struct.unpack_from("<I", c, 36)[0]
+        self._values_offset = struct.unpack_from("<I", c, 40)[0]
+        name_len = struct.unpack_from("<H", c, 72)[0]
+        raw = c[76:76 + name_len]
+        self.name = raw.decode("latin-1") if flags & 0x20 else raw.decode("utf-16-le", "replace")
+
+    def subkeys(self) -> List["Key"]:
+        out: List[Key] = []
+        if self._n_subkeys and self._subkeys_offset != NO_OFFSET:
+            self._walk(self._subkeys_offset, out)
+        return out
+
+    def _walk(self, offset: int, out: List["Key"]) -> None:
+        c = self.hive.cell(offset)
+        sig = c[:2]
+        count = struct.unpack_from("<H", c, 2)[0]
+        if sig in (b"lf", b"lh"):
+            for i in range(count):
+                out.append(Key(self.hive, struct.unpack_from("<I", c, 4 + 8 * i)[0]))
+        elif sig == b"li":
+            for i in range(count):
+                out.append(Key(self.hive, struct.unpack_from("<I", c, 4 + 4 * i)[0]))
+        elif sig == b"ri":
+            for i in range(count):
+                self._walk(struct.unpack_from("<I", c, 4 + 4 * i)[0], out)
+        else:
+            raise HiveError("unknown subkey list type %r" % sig)
+
+    def subkey(self, name: str) -> Optional["Key"]:
+        lname = name.lower()
+        for k in self.subkeys():
+            if k.name.lower() == lname:
+                return k
+        return None
+
+    def path(self, path: str) -> Optional["Key"]:
+        key: Optional[Key] = self
+        for part in re.split(r"[\\/]+", path):
+            if part and key is not None:
+                key = key.subkey(part)
+        return key
+
+    def values(self) -> List["Value"]:
+        if not self._n_values or self._values_offset == NO_OFFSET:
+            return []
+        lst = self.hive.cell(self._values_offset)
+        return [Value(self.hive, struct.unpack_from("<I", lst, 4 * i)[0])
+                for i in range(self._n_values)]
+
+    def value(self, name: str) -> Optional["Value"]:
+        lname = name.lower()
+        for v in self.values():
+            if v.name.lower() == lname:
+                return v
+        return None
+
+
+class Value:
+    def __init__(self, hive: Hive, offset: int):
+        c = hive.cell(offset)
+        if c[:2] != b"vk":
+            raise HiveError("expected value record at %#x" % offset)
+        name_len, size, data_offset, self.type, flags = struct.unpack_from("<HIIIH", c, 2)
+        raw = c[20:20 + name_len]
+        self.name = raw.decode("latin-1") if flags & 1 else raw.decode("utf-16-le", "replace")
+        if size & 0x80000000:  # small data stored inline in the offset field
+            self.raw = struct.pack("<I", data_offset)[:size & 0x7FFFFFFF]
+        elif size == 0:
+            self.raw = b""
+        else:
+            self.raw = hive.read_data(data_offset, size)
+
+    @property
+    def data(self):
+        if self.type == REG_DWORD and len(self.raw) >= 4:
+            return struct.unpack("<I", self.raw[:4])[0]
+        if self.type == REG_QWORD and len(self.raw) >= 8:
+            return struct.unpack("<Q", self.raw[:8])[0]
+        if self.type in (REG_SZ, REG_EXPAND_SZ):
+            return self.raw.decode("utf-16-le", "replace").split("\0")[0]
+        return self.raw
+
+    def as_int(self, default: int = 0) -> int:
+        if self.type in (REG_DWORD, REG_QWORD):
+            return self.data
+        return int.from_bytes(self.raw, "little") if self.raw else default
+
+
+# --------------------------------------------------------------------------
+# Windows side: pairing keys stored under BTHPORT\Parameters\Keys
+# --------------------------------------------------------------------------
+
+_MAC12 = re.compile(r"^[0-9a-fA-F]{12}$")
+_MAC_COLON = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+
+def win_to_mac(s: str) -> str:
+    s = s.upper()
+    return ":".join(s[i:i + 2] for i in range(0, 12, 2))
+
+
+def mac_to_win(mac: str) -> str:
+    return mac.replace(":", "").lower()
+
+
+@dataclass
+class WinEntry:
+    adapter: str          # AA:BB:CC:DD:EE:FF
+    mac: str              # device address, same format
+    kind: str             # "classic" (BR/EDR link key) or "le" (Bluetooth Low Energy)
+    name: Optional[str] = None
+    link_key: Optional[bytes] = None
+    ltk: Optional[bytes] = None
+    key_length: int = 16
+    ediv: int = 0
+    erand: int = 0
+    irk: Optional[bytes] = None
+
+    def material(self) -> bytes:
+        if self.kind == "classic":
+            return self.link_key or b""
+        return (self.ltk or b"") + struct.pack("<IQ", self.ediv, self.erand)
+
+    @property
+    def state_key(self) -> str:
+        return "%s|%s|%s" % (self.adapter, self.mac, self.kind)
+
+    def label(self) -> str:
+        return self.name or "(unknown name)"
+
+
+def read_windows_keys(hive: Hive) -> List[WinEntry]:
+    root = hive.root
+    current = 1
+    select = root.subkey("Select")
+    if select is not None:
+        v = select.value("Current")
+        if v is not None and v.type == REG_DWORD:
+            current = v.data
+    control_set = root.subkey("ControlSet%03d" % current) or root.subkey("ControlSet001")
+    if control_set is None:
+        raise HiveError("no ControlSet found - is this really the Windows SYSTEM hive?")
+    params = control_set.path(r"Services\BTHPORT\Parameters")
+    if params is None:
+        return []
+
+    names: Dict[str, str] = {}
+    devices = params.subkey("Devices")
+    if devices is not None:
+        for d in devices.subkeys():
+            v = d.value("Name")
+            if _MAC12.match(d.name) and v is not None:
+                if v.type in (REG_SZ, REG_EXPAND_SZ):
+                    n = v.data
+                else:
+                    n = v.raw.split(b"\0")[0].decode("utf-8", "replace")
+                if n.strip():
+                    names[d.name.lower()] = n.strip()
+
+    out: List[WinEntry] = []
+    keys = params.subkey("Keys")
+    if keys is None:
+        return out
+    for adapter_key in keys.subkeys():
+        if not _MAC12.match(adapter_key.name):
+            continue
+        adapter = win_to_mac(adapter_key.name)
+        # Classic devices: one REG_BINARY value per device, named by its address.
+        for v in adapter_key.values():
+            if _MAC12.match(v.name) and v.type == REG_BINARY and len(v.raw) == 16:
+                out.append(WinEntry(adapter, win_to_mac(v.name), "classic",
+                                    names.get(v.name.lower()), link_key=v.raw))
+        # LE devices: one subkey per device holding LTK / EDIV / ERand / IRK ...
+        for dk in adapter_key.subkeys():
+            if not _MAC12.match(dk.name):
+                continue
+            ltk = dk.value("LTK")
+            if ltk is None or len(ltk.raw) != 16:
+                continue
+
+            def num(name: str, default: int = 0) -> int:
+                x = dk.value(name)
+                return x.as_int(default) if x is not None else default
+
+            irk_v = dk.value("IRK")
+            irk = irk_v.raw if irk_v is not None and len(irk_v.raw) == 16 and any(irk_v.raw) else None
+            out.append(WinEntry(adapter, win_to_mac(dk.name), "le", names.get(dk.name.lower()),
+                                ltk=ltk.raw, key_length=num("KeyLength", 16) or 16,
+                                ediv=num("EDIV"), erand=num("ERand"), irk=irk))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Linux side: BlueZ storage (/var/lib/bluetooth/<adapter>/<device>/info)
+# --------------------------------------------------------------------------
+
+def new_info_parser() -> configparser.ConfigParser:
+    cp = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",),
+                                   comment_prefixes=("#",), inline_comment_prefixes=None)
+    cp.optionxform = str  # keep key case (BlueZ keys are case sensitive)
+    return cp
+
+
+@dataclass
+class LinuxDevice:
+    adapter: str
+    mac: str
+    path: str  # device directory
+    info: configparser.ConfigParser
+
+    @property
+    def info_path(self) -> str:
+        return os.path.join(self.path, "info")
+
+    @property
+    def name(self) -> Optional[str]:
+        return self.info.get("General", "Name", fallback=None) or \
+            self.info.get("General", "Alias", fallback=None)
+
+    def material(self, kind: str) -> Optional[bytes]:
+        try:
+            if kind == "classic":
+                k = self.info.get("LinkKey", "Key", fallback="")
+                return bytes.fromhex(k) if k else None
+            k = self.info.get("LongTermKey", "Key", fallback="")
+            if not k:
+                return None
+            ediv = int(self.info.get("LongTermKey", "EDiv", fallback="0") or 0)
+            rand = int(self.info.get("LongTermKey", "Rand", fallback="0") or 0)
+            return bytes.fromhex(k) + struct.pack("<IQ", ediv, rand)
+        except ValueError:
+            return None
+
+
+def read_bluez(bluez_dir: str) -> Dict[str, Dict[str, LinuxDevice]]:
+    result: Dict[str, Dict[str, LinuxDevice]] = {}
+    try:
+        adapters = os.listdir(bluez_dir)
+    except PermissionError:
+        raise UserError("cannot read %s - run with sudo" % bluez_dir)
+    except FileNotFoundError:
+        raise UserError("%s not found - is BlueZ installed?" % bluez_dir)
+    for ad in sorted(adapters):
+        ad_path = os.path.join(bluez_dir, ad)
+        if not _MAC_COLON.match(ad) or not os.path.isdir(ad_path):
+            continue
+        devs: Dict[str, LinuxDevice] = {}
+        for dev in sorted(os.listdir(ad_path)):
+            info = os.path.join(ad_path, dev, "info")
+            if _MAC_COLON.match(dev) and os.path.isfile(info):
+                cp = new_info_parser()
+                try:
+                    cp.read(info, encoding="utf-8")
+                except configparser.Error as e:
+                    print("warning: skipping unreadable %s: %s" % (info, e), file=sys.stderr)
+                    continue
+                devs[dev] = LinuxDevice(ad, dev, os.path.join(ad_path, dev), cp)
+        result[ad] = devs
+    return result
+
+
+def write_info(cp: configparser.ConfigParser, path: str) -> None:
+    tmp = path + ".bt-dualboot-sync.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        cp.write(f, space_around_delimiters=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def apply_windows_entry(cp: configparser.ConfigParser, e: WinEntry, irk_reverse: bool) -> None:
+    def ensure(section: str, defaults: Dict[str, str]) -> None:
+        if not cp.has_section(section):
+            cp.add_section(section)
+        for k, v in defaults.items():
+            if not cp.has_option(section, k):
+                cp.set(section, k, v)
+
+    if e.kind == "classic":
+        ensure("LinkKey", {"Type": "4", "PINLength": "0"})
+        cp.set("LinkKey", "Key", e.link_key.hex().upper())
+    else:
+        ensure("LongTermKey", {"Authenticated": "0"})
+        cp.set("LongTermKey", "Key", e.ltk.hex().upper())
+        cp.set("LongTermKey", "EncSize", str(e.key_length))
+        cp.set("LongTermKey", "EDiv", str(e.ediv))
+        cp.set("LongTermKey", "Rand", str(e.erand))
+        if e.irk:
+            irk = e.irk[::-1] if irk_reverse else e.irk
+            ensure("IdentityResolvingKey", {})
+            cp.set("IdentityResolvingKey", "Key", irk.hex().upper())
+
+
+# --------------------------------------------------------------------------
+# Locating the Windows SYSTEM hive (mounting the Windows partition read-only)
+# --------------------------------------------------------------------------
+
+def run(cmd: List[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", "%s: not found" % cmd[0])
+
+
+def ci_path(root: str, *parts: str) -> Optional[str]:
+    """Case-insensitive path lookup (NTFS drivers on Linux may be case sensitive)."""
+    cur = root
+    for part in parts:
+        try:
+            entries = os.listdir(cur)
+        except OSError:
+            return None
+        match = [e for e in entries if e.lower() == part.lower()]
+        if not match:
+            return None
+        cur = os.path.join(cur, match[0])
+    return cur
+
+
+def hive_in(root: str) -> Optional[str]:
+    p = ci_path(root, "Windows", "System32", "config", "SYSTEM")
+    return p if p and os.path.isfile(p) else None
+
+
+def list_block_devices() -> List[Dict[str, str]]:
+    r = run(["lsblk", "-P", "-p", "-o", "NAME,FSTYPE,MOUNTPOINT"])
+    devs = []
+    for line in r.stdout.splitlines():
+        d = dict(re.findall(r'(\w+)="([^"]*)"', line))
+        if "MOUNTPOINT" in d:
+            d["MOUNTPOINT"] = re.sub(r"\\x([0-9a-fA-F]{2})",
+                                     lambda m: chr(int(m.group(1), 16)), d["MOUNTPOINT"])
+        devs.append(d)
+    return devs
+
+
+class WindowsSource:
+    """Finds the SYSTEM hive; mounts NTFS partitions read-only when necessary."""
+
+    def __init__(self, spec: Optional[str], log):
+        self.spec = spec
+        self.log = log
+        self._mounts: List[str] = []
+
+    def __enter__(self) -> "WindowsSource":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for mp in reversed(self._mounts):
+            run(["umount", mp])
+            try:
+                os.rmdir(mp)
+            except OSError:
+                pass
+
+    def _mount(self, dev: str) -> Optional[str]:
+        mp = tempfile.mkdtemp(prefix="bt-dualboot-sync-")
+        for cmd in (["mount", "-t", "ntfs3", "-o", "ro", dev, mp],
+                    ["mount", "-t", "ntfs-3g", "-o", "ro", dev, mp],
+                    ["mount", "-o", "ro", dev, mp]):
+            if run(cmd).returncode == 0:
+                self._mounts.append(mp)
+                self.log.debug("mounted %s read-only at %s" % (dev, mp))
+                return mp
+        os.rmdir(mp)
+        self.log.debug("could not mount %s" % dev)
+        return None
+
+    def _unmount_last(self) -> None:
+        mp = self._mounts.pop()
+        run(["umount", mp])
+        try:
+            os.rmdir(mp)
+        except OSError:
+            pass
+
+    def locate(self) -> str:
+        if self.spec:
+            if os.path.isfile(self.spec):
+                return self.spec
+            if os.path.isdir(self.spec):
+                h = hive_in(self.spec)
+                if h:
+                    return h
+                raise UserError("no Windows\\System32\\config\\SYSTEM under %s" % self.spec)
+            if self.spec.startswith("/dev/"):
+                mp = self._mount(self.spec)
+                h = hive_in(mp) if mp else None
+                if h:
+                    return h
+                raise UserError("could not find the Windows registry on %s" % self.spec)
+            raise UserError("--windows: %s does not exist" % self.spec)
+
+        devices = list_block_devices()
+        if not devices:
+            raise UserError("lsblk found no partitions; pass the Windows partition with --windows")
+        bitlocker = [d["NAME"] for d in devices if d.get("FSTYPE", "").lower() == "bitlocker"]
+        ntfs = [d for d in devices if d.get("FSTYPE", "").lower() in ("ntfs", "ntfs3")]
+        for d in ntfs:  # already mounted partitions first
+            if d.get("MOUNTPOINT"):
+                h = hive_in(d["MOUNTPOINT"])
+                if h:
+                    return h
+        for d in ntfs:
+            if not d.get("MOUNTPOINT"):
+                mp = self._mount(d["NAME"])
+                if mp:
+                    h = hive_in(mp)
+                    if h:
+                        self.log.info("Windows found on %s" % d["NAME"])
+                        return h
+                    self._unmount_last()
+        msg = "could not find a Windows installation (no NTFS partition with Windows\\System32\\config\\SYSTEM)."
+        if bitlocker:
+            msg += ("\nThese partitions are BitLocker-encrypted: %s\n"
+                    "Unlock one first (e.g. `sudo dislocker ...` or `udisksctl unlock`), mount it, "
+                    "and pass the mount point with --windows, or turn off BitLocker / Device "
+                    "Encryption in Windows." % ", ".join(bitlocker))
+        raise UserError(msg)
+
+
+# --------------------------------------------------------------------------
+# Planning: compare both sides and decide what to do per device
+# --------------------------------------------------------------------------
+
+IN_SYNC = "in-sync"
+WIN_NEWER = "windows-newer"       # re-paired in Windows -> copy to Linux
+LINUX_NEWER = "linux-newer"       # re-paired in Linux -> export to Windows
+DIFFERENT = "different"           # keys differ, no history to tell which is newer
+ADDR_CHANGED = "address-changed"  # LE device got a new address when re-paired in Windows
+NOT_IN_LINUX = "not-in-linux"
+NO_ADAPTER = "no-adapter"
+
+STATUS_TEXT = {
+    IN_SYNC: "OK, already in sync",
+    WIN_NEWER: "Windows key is newer -> copy to Linux",
+    LINUX_NEWER: "Linux key is newer -> export to Windows",
+    DIFFERENT: "keys differ",
+    ADDR_CHANGED: "re-paired in Windows with a new address -> move Linux entry",
+    NOT_IN_LINUX: "never paired in Linux - pair it in Linux once, then pair in Windows",
+    NO_ADAPTER: "this Bluetooth adapter is not known to Linux",
+}
+
+
+@dataclass
+class Item:
+    entry: WinEntry
+    status: str
+    linux: Optional[LinuxDevice] = None
+
+
+def digest(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def build_plan(win: List[WinEntry], linux: Dict[str, Dict[str, LinuxDevice]],
+               state: Dict[str, str]) -> List[Item]:
+    win_macs: Dict[str, set] = {}
+    for e in win:
+        win_macs.setdefault(e.adapter, set()).add(e.mac)
+
+    items: List[Item] = []
+    for e in win:
+        devs = linux.get(e.adapter)
+        if devs is None:
+            items.append(Item(e, NO_ADAPTER))
+            continue
+        ld = devs.get(e.mac)
+        recorded = state.get(e.state_key)
+        win_unchanged = recorded is not None and recorded == digest(e.material())
+        if ld is None and e.kind == "le" and e.name:
+            # Many LE mice/keyboards pick a new random address for every pairing.
+            cands = [d for d in devs.values()
+                     if d.mac not in win_macs[e.adapter] and d.name == e.name
+                     and d.info.has_section("LongTermKey")]
+            if len(cands) == 1:
+                # If the Windows key did not change since the last sync, it was
+                # Linux that re-paired (and got the new address) - leave it alone.
+                items.append(Item(e, LINUX_NEWER if win_unchanged else ADDR_CHANGED, cands[0]))
+                continue
+        if ld is None:
+            items.append(Item(e, NOT_IN_LINUX))
+            continue
+        if ld.material(e.kind) == e.material():
+            status = IN_SYNC
+        elif recorded is None:
+            status = DIFFERENT
+        elif win_unchanged:
+            status = LINUX_NEWER
+        else:
+            status = WIN_NEWER
+        items.append(Item(e, status, ld))
+    return items
+
+
+# --------------------------------------------------------------------------
+# Helpers: logging, state, backups, export
+# --------------------------------------------------------------------------
+
+class Log:
+    def __init__(self, verbose: bool = False, quiet: bool = False):
+        self.verbose, self.quiet = verbose, quiet
+
+    def info(self, msg: str) -> None:
+        if not self.quiet:
+            print(msg)
+
+    def debug(self, msg: str) -> None:
+        if self.verbose:
+            print("  [debug] " + msg)
+
+    def warn(self, msg: str) -> None:
+        print("warning: " + msg, file=sys.stderr)
+
+
+def load_state(path: str) -> Dict[str, str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("windows_keys", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path: str, state: Dict[str, str]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "windows_keys": state}, f, indent=1, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def backup_bluez(bluez_dir: str, backup_root: str, log: Log) -> str:
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dst = os.path.join(backup_root, stamp)
+    n = 1
+    while os.path.exists(dst):
+        n += 1
+        dst = os.path.join(backup_root, "%s-%d" % (stamp, n))
+    os.makedirs(backup_root, mode=0o700, exist_ok=True)
+    shutil.copytree(bluez_dir, dst, symlinks=True)
+    old = sorted(os.listdir(backup_root))
+    for name in old[:-KEEP_BACKUPS]:
+        shutil.rmtree(os.path.join(backup_root, name), ignore_errors=True)
+    log.info("Backup of %s saved to %s" % (bluez_dir, dst))
+    return dst
+
+
+def fstype_of(path: str) -> Optional[str]:
+    try:
+        with open("/proc/mounts", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == path:
+                    return parts[2]
+    except OSError:
+        pass
+    return None
+
+
+def find_esp() -> Optional[str]:
+    for c in ESP_CANDIDATES:
+        if os.path.ismount(c) and fstype_of(c) in ("vfat", "msdos", "fat") and ci_path(c, "EFI"):
+            return c
+    return None
+
+
+def default_export_path() -> Optional[str]:
+    esp = find_esp()
+    return os.path.join(esp, EXPORT_SUBDIR, EXPORT_FILENAME) if esp else None
+
+
+def export_record(item: Item, irk_reverse: bool) -> dict:
+    e, ld = item.entry, item.linux
+    rec = {"adapter": mac_to_win(e.adapter), "mac": mac_to_win(e.mac),
+           "name": ld.name or e.name, "kind": e.kind}
+    if e.kind == "classic":
+        rec["link_key"] = ld.info.get("LinkKey", "Key").upper()
+    else:
+        s = "LongTermKey"
+        rec["ltk"] = ld.info.get(s, "Key").upper()
+        rec["key_length"] = int(ld.info.get(s, "EncSize", fallback="16") or 16)
+        rec["ediv"] = int(ld.info.get(s, "EDiv", fallback="0") or 0)
+        # hex string: JSON/PowerShell cannot hold every unsigned 64-bit integer
+        rec["erand"] = "%016x" % int(ld.info.get(s, "Rand", fallback="0") or 0)
+        irk = ld.info.get("IdentityResolvingKey", "Key", fallback="")
+        if irk:
+            b = bytes.fromhex(irk)
+            rec["irk"] = (b[::-1] if irk_reverse else b).hex().upper()
+    return rec
+
+
+def write_export(path: str, records: List[dict], log: Log) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    doc = {"generator": "%s %s" % (PROG, VERSION),
+           "created": datetime.datetime.now().isoformat(timespec="seconds"),
+           "devices": records}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    log.info("Exported %d device key(s) to %s" % (len(records), path))
+    log.info("-> In Windows, run windows\\bt-dualboot-sync.ps1 (or install its startup task) to import them.")
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def print_plan(items: List[Item], log: Log, dirty: bool) -> None:
+    if not items:
+        log.info("No paired Bluetooth devices found in Windows.")
+        return
+    adapters = sorted({i.entry.adapter for i in items})
+    for ad in adapters:
+        log.info("\nAdapter %s" % ad)
+        for it in [i for i in items if i.entry.adapter == ad]:
+            e = it.entry
+            extra = ""
+            if it.status in (ADDR_CHANGED,) or (it.linux and it.linux.mac != e.mac):
+                extra = "  [Linux: %s]" % it.linux.mac
+            log.info("  %-6s %s  %-28s %s%s" % (
+                "LE" if e.kind == "le" else "BR/EDR", e.mac, e.label()[:28],
+                STATUS_TEXT[it.status], extra))
+    if dirty:
+        log.warn("the Windows registry was not cleanly saved (Fast Startup / hibernation or a crash). "
+                 "Very recent pairings may be missing. Fix: in Windows, disable Fast Startup "
+                 "(`windows\\bt-dualboot-sync.ps1 -DisableFastStartup`) and use Restart, not Shut down.")
+
+
+def confirm(question: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise UserError("refusing to modify files without --yes in a non-interactive session")
+    return input(question + " [y/N] ").strip().lower() in ("y", "yes")
+
+
+def restart_bluetooth(log: Log) -> None:
+    r = run(["systemctl", "restart", "bluetooth"])
+    if r.returncode == 0:
+        log.info("Restarted bluetooth.service - your devices should reconnect in a few seconds.")
+    else:
+        log.warn("could not restart bluetooth.service (%s). Run: sudo systemctl restart bluetooth"
+                 % (r.stderr.strip() or r.returncode))
+
+
+def apply_items(items: List[Item], args, state: Dict[str, str], log: Log) -> int:
+    """Copy Windows keys into BlueZ. Returns the number of changed devices."""
+    if not items:
+        return 0
+    backup_bluez(args.bluez_dir, args.backup_dir, log)
+    changed = 0
+    for it in items:
+        e, ld = it.entry, it.linux
+        if it.status == ADDR_CHANGED:
+            new_dir = os.path.join(os.path.dirname(ld.path), e.mac)
+            if os.path.exists(new_dir):
+                log.warn("%s already exists, skipping %s" % (new_dir, e.label()))
+                continue
+            shutil.copytree(ld.path, new_dir, symlinks=True)
+            cache_dir = os.path.join(os.path.dirname(ld.path), "cache")
+            old_cache, new_cache = os.path.join(cache_dir, ld.mac), os.path.join(cache_dir, e.mac)
+            if os.path.isfile(old_cache) and not os.path.exists(new_cache):
+                shutil.copy2(old_cache, new_cache)
+            shutil.rmtree(ld.path)  # a copy is in the backup
+            ld = LinuxDevice(ld.adapter, e.mac, new_dir, ld.info)
+            log.info("  moved %s -> %s (%s)" % (it.linux.mac, e.mac, e.label()))
+        apply_windows_entry(ld.info, e, not args.irk_no_reverse)
+        write_info(ld.info, ld.info_path)
+        state[e.state_key] = digest(e.material())
+        log.info("  updated %s %s (%s)" % ("LE" if e.kind == "le" else "BR/EDR", e.mac, e.label()))
+        changed += 1
+    return changed
+
+
+def load_everything(args, log: Log, src: WindowsSource):
+    hive_path = src.locate()
+    log.debug("Windows registry hive: %s" % hive_path)
+    try:
+        hive = Hive.open(hive_path)
+        win = read_windows_keys(hive)
+    except (HiveError, struct.error) as ex:
+        raise UserError("could not read the Windows registry (%s): %s" % (hive_path, ex))
+    linux = read_bluez(args.bluez_dir)
+    state = load_state(args.state_file)
+    items = build_plan(win, linux, state)
+    for it in items:  # remember what is already identical
+        if it.status == IN_SYNC:
+            state[it.entry.state_key] = digest(it.entry.material())
+    return hive, items, state
+
+
+def cmd_status(args, log: Log) -> int:
+    with WindowsSource(args.windows, log) as src:
+        hive, items, _ = load_everything(args, log, src)
+    print_plan(items, log, hive.dirty)
+    return 0
+
+
+def cmd_sync(args, log: Log) -> int:
+    """Windows -> Linux."""
+    with WindowsSource(args.windows, log) as src:
+        hive, items, state = load_everything(args, log, src)
+    print_plan(items, log, hive.dirty)
+    wanted = {WIN_NEWER, DIFFERENT, ADDR_CHANGED} | ({LINUX_NEWER} if args.force else set())
+    todo = [i for i in items if i.status in wanted]
+    skipped = [i for i in items if i.status == LINUX_NEWER and not args.force]
+    if skipped:
+        log.info("\n%d device(s) were re-paired in Linux after the last sync; they were left alone "
+                 "(use `export`, or --force to overwrite them with the Windows keys)." % len(skipped))
+    if not todo:
+        log.info("\nNothing to copy from Windows.")
+        if not args.dry_run:
+            save_state(args.state_file, state)
+        return 0
+    if args.dry_run:
+        log.info("\n--dry-run: would update %d device(s)." % len(todo))
+        return 0
+    if not confirm("\nCopy %d Windows key(s) into Linux?" % len(todo), args.yes):
+        return 1
+    changed = apply_items(todo, args, state, log)
+    save_state(args.state_file, state)
+    if changed and not args.no_restart:
+        restart_bluetooth(log)
+    return 0
+
+
+def cmd_export(args, log: Log) -> int:
+    """Linux -> file for Windows."""
+    with WindowsSource(args.windows, log) as src:
+        hive, items, state = load_everything(args, log, src)
+    print_plan(items, log, hive.dirty)
+    wanted = {LINUX_NEWER, DIFFERENT} | ({WIN_NEWER} if args.force else set())
+    todo = [i for i in items if i.status in wanted and i.linux and i.linux.mac == i.entry.mac]
+    path = args.export_path or default_export_path()
+    if not path:
+        raise UserError("EFI system partition not found at %s; pass --export-path"
+                        % ", ".join(ESP_CANDIDATES))
+    if not todo:
+        log.info("\nNo Linux keys newer than Windows - nothing to export.")
+        return 0
+    if args.dry_run:
+        log.info("\n--dry-run: would export %d device(s) to %s" % (len(todo), path))
+        return 0
+    write_export(path, [export_record(i, not args.irk_no_reverse) for i in todo], log)
+    save_state(args.state_file, state)
+    return 0
+
+
+def cmd_auto(args, log: Log) -> int:
+    """Boot-time mode: copy newer Windows keys, export newer Linux keys."""
+    with WindowsSource(args.windows, log) as src:
+        hive, items, state = load_everything(args, log, src)
+    print_plan(items, log, hive.dirty)
+    to_linux = [i for i in items if i.status in (WIN_NEWER, DIFFERENT, ADDR_CHANGED)]
+    to_win = [i for i in items if i.status == LINUX_NEWER and i.linux and i.linux.mac == i.entry.mac]
+    if args.dry_run:
+        log.info("\n--dry-run: %d to Linux, %d to Windows" % (len(to_linux), len(to_win)))
+        return 0
+    changed = apply_items(to_linux, args, state, log)
+    save_state(args.state_file, state)
+    path = args.export_path or default_export_path()
+    if path:
+        if to_win and not hive.dirty:
+            write_export(path, [export_record(i, not args.irk_no_reverse) for i in to_win], log)
+        elif os.path.exists(path) and not to_win:
+            os.remove(path)  # nothing pending - don't let Windows import stale keys
+    elif to_win:
+        log.warn("EFI partition not found; cannot export %d Linux key(s) for Windows" % len(to_win))
+    if changed and not args.no_restart:
+        restart_bluetooth(log)
+    return 0
+
+
+def cmd_install(args, log: Log) -> int:
+    src = os.path.realpath(__file__)
+    if src != INSTALL_BIN:
+        shutil.copy2(src, INSTALL_BIN)
+    os.chmod(INSTALL_BIN, 0o755)
+    with open(UNIT_PATH, "w", encoding="utf-8") as f:
+        f.write(UNIT_TEMPLATE.format(bin=INSTALL_BIN))
+    for cmd in (["systemctl", "daemon-reload"], ["systemctl", "enable", "bt-dualboot-sync.service"]):
+        r = run(cmd)
+        if r.returncode != 0:
+            raise UserError("%s failed: %s" % (" ".join(cmd), r.stderr.strip()))
+    log.info("Installed %s and enabled bt-dualboot-sync.service." % INSTALL_BIN)
+    log.info("From now on, every Linux boot copies newer Windows keys before Bluetooth starts.")
+    return 0
+
+
+def cmd_uninstall(args, log: Log) -> int:
+    run(["systemctl", "disable", "bt-dualboot-sync.service"])
+    for p in (UNIT_PATH, INSTALL_BIN):
+        if os.path.exists(p):
+            os.remove(p)
+    run(["systemctl", "daemon-reload"])
+    log.info("Removed bt-dualboot-sync service. (State and backups are kept in %s and %s.)"
+             % (os.path.dirname(DEFAULT_STATE_FILE), DEFAULT_BACKUP_DIR))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--windows", metavar="PATH",
+                        help="Windows SYSTEM hive file, Windows mount point, or /dev/partition "
+                             "(default: auto-detect)")
+    common.add_argument("--bluez-dir", default=DEFAULT_BLUEZ_DIR, help=argparse.SUPPRESS)
+    common.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=argparse.SUPPRESS)
+    common.add_argument("--backup-dir", default=DEFAULT_BACKUP_DIR, help=argparse.SUPPRESS)
+    common.add_argument("--export-path", metavar="FILE",
+                        help="where to write keys for Windows (default: <EFI partition>/%s/%s)"
+                             % (EXPORT_SUBDIR, EXPORT_FILENAME))
+    common.add_argument("-n", "--dry-run", action="store_true", help="show what would change, change nothing")
+    common.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    common.add_argument("-f", "--force", action="store_true",
+                        help="ignore sync history (sync: Windows always wins; export: Linux always wins)")
+    common.add_argument("--no-restart", action="store_true", help="do not restart bluetooth.service")
+    common.add_argument("--irk-no-reverse", action="store_true",
+                        help="do not byte-swap the LE Identity Resolving Key (try this if an LE "
+                             "device with a private address does not reconnect)")
+    common.add_argument("-v", "--verbose", action="store_true")
+    common.add_argument("-q", "--quiet", action="store_true")
+
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Share Bluetooth pairings between Windows and Linux on dual-boot PCs.",
+        epilog="Typical use: pair the device in Linux, reboot to Windows and pair it there, "
+               "reboot to Linux and run `sudo %s sync`. Run `sudo %s install` to do this "
+               "automatically at every boot." % (PROG, PROG))
+    p.add_argument("--version", action="version", version="%s %s" % (PROG, VERSION))
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+    sub.add_parser("status", parents=[common], help="list devices and whether their keys match")
+    sub.add_parser("sync", parents=[common], help="copy Windows keys into Linux (Windows -> Linux)")
+    sub.add_parser("export", parents=[common],
+                   help="export Linux keys for the Windows importer (Linux -> Windows)")
+    sub.add_parser("auto", parents=[common],
+                   help="both directions, decided by sync history (used by the boot service)")
+    sub.add_parser("install", parents=[common], help="install the boot-time systemd service")
+    sub.add_parser("uninstall", parents=[common], help="remove the boot-time systemd service")
+    return p
+
+
+COMMANDS = {"status": cmd_status, "sync": cmd_sync, "export": cmd_export, "auto": cmd_auto,
+            "install": cmd_install, "uninstall": cmd_uninstall}
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
+    log = Log(args.verbose, args.quiet)
+    needs_root = args.command in ("install", "uninstall") or args.bluez_dir == DEFAULT_BLUEZ_DIR
+    if needs_root and hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("%s: please run with sudo (Bluetooth keys are only readable by root)" % PROG,
+              file=sys.stderr)
+        return 1
+    try:
+        return COMMANDS[args.command](args, log)
+    except UserError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
