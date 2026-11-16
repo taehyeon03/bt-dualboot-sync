@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import struct
+import sys
 import tempfile
 import unittest
 
@@ -15,6 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _loader = importlib.machinery.SourceFileLoader("btsync", os.path.join(HERE, "..", "bt-dualboot-sync"))
 _spec = importlib.util.spec_from_loader("btsync", _loader)
 bt = importlib.util.module_from_spec(_spec)
+sys.modules["btsync"] = bt  # dataclasses needs the module registered (Python < 3.13)
 _loader.exec_module(bt)
 
 
